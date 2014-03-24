@@ -1,143 +1,55 @@
 (ns eventure.core
-  (:require [eventure.protocols :as p]
-            [clojure.core.async :as a :refer (<!! <!)])
+  "The eventure API."
   (:import [java.net URI]))
 
+;;; Protocol definitions.
 
-(def ^:private reusable-clients (atom {})) ; uri -> client
-(def ^:private subscriptions (atom {})) ; identifier -> commandc
+(defprotocol DirectoryWriter
+  (add-source [this topic uri]
+    "Given a topic, this function writes the given URI to the directory
+    service.")
 
-
-(defn- client-for-uri
-  "Creates or reuses an existing client for the given URI."
-  [^URI uri]
-  (locking reusable-clients
-    (or (get @reusable-clients uri)
-        (let [client (p/mk-client uri)]
-          (when (p/reusable? client)
-            (swap! reusable-clients assoc uri client))
-          client))))
+  (remove-source [this topic uri]
+    "Given a topic, this function removes the given URI from the
+    directory service."))
 
 
-(defn- subscribe*
-  "Starts the loop of watching the source channel, and piping
-  subscribed clients to the given events channel. The command channel
-  is used for stopping the subscription."
-  [identifier channel sourcesc commandc {:keys [on-source-join wait-for-source]
-                                         :or {wait-for-source -1}
-                                         :as options}]
-  (let [eventm (a/mix channel)]
-    (a/go-loop [waitc (when-not (neg? wait-for-source)
-                        (a/timeout wait-for-source))
-                clients {}]  ; uri -> client
-      (let [[val port] (a/alts! (keep identity [commandc sourcesc waitc]) :priority true)]
-        (condp = port
-          sourcesc (let [{:keys [event uri]} val]
-                     (case event
-                       :joined (case on-source-join
-                                 :mix (let [client (client-for-uri uri)]
-                                        (a/admix eventm (p/subscribe client identifier))
-                                        (recur nil (assoc clients uri client)))
-                                 :first (if (empty? clients)
-                                          (let [client (client-for-uri uri)]
-                                            (a/admix eventm (p/subscribe client identifier))
-                                            (recur nil {uri client}))
-                                          (recur nil clients))
-                                 :last (do (when-let [client (first (vals clients))]
-                                             (p/unsubscribe client identifier))
-                                           (let [client (client-for-uri uri)]
-                                             (a/admix eventm (p/subscribe client identifier))
-                                             (recur nil {uri client})))
-                                 :unsubscribe (if (empty? clients)
-                                                (let [client (client-for-uri uri)]
-                                                  (a/admix eventm (p/subscribe client identifier))
-                                                  (recur nil {uri client}))
-                                                (do (a/put! commandc :unsubscribe)
-                                                    (recur nil clients))))
-                       :left (let [client (get clients uri)
-                                   new-clients (dissoc clients uri)
-                                   new-waitc (when (and (empty? new-clients) (> wait-for-source 0))
-                                               (a/timeout wait-for-source))]
-                               (when client (p/unsubscribe client identifier))
-                               (when (and (empty? new-clients) (= wait-for-source 0))
-                                 (a/put! commandc :unsubscribe))
-                               (recur new-waitc new-clients))))
-          commandc (if (= val :unsubscribe)
-                     (do (doseq [[_ client] clients]
-                           (p/unsubscribe client identifier))
-                         (doseq [c (keep identity [channel sourcesc commandc waitc])]
-                           (a/close! c))
-                         (swap! subscriptions dissoc identifier))
-                     (recur waitc clients))
-          waitc (do (a/put! commandc :unsubscribe)
-                    (recur nil clients)))))))
+;; Record used for notifying watchers about changes in the directory.
+;; Field `event` is either :joined or :left.
+(defrecord SourceUpdate [topic uri event])
 
 
-(defn subscribe
-  "Subscribe to an event stream named by the given identifier. The
-  events will be put on the, possibly supplied, channel. Returns the
-  channel. Some other options can be supplied as well:
+(defprotocol DirectoryReader
+  (sources [this topic]
+    "This function returns the currently known sources of the given
+    topic.")
 
-  on-source-join
+  (watch-sources [this topic init] [this topic init chan]
+    "This function starts a backgrould loop which reads the directory
+    service and puts updates about sources for the given topic on a,
+    possibly supplied, channel. The channel is returned. Whenever a
+    channel is closed, all watches for that channel are removed.
+    Updates on the channel are SourceUpdate records. The init
+    parameter is one of the following:
 
-    Whenever a new source joins and the subscription is already
-    connected to a source, the join is handled depending on the value
-    of this option:
+    :all - all currently known sources are put on the channel.
 
-      :mix - the subscription will also start receiving events from
-             the new source. (default)
+    :last - the last joined source is put on the channel.
 
-      :first - the newly joined source is ignored, and the
-               subscription will continue to receive events from the
-               first source it was connected to.
+    :random - a randomly chosen source is put on the channel.")
 
-      :last - the subscription will start to receive events from the
-              newly joined source, and will stop receiving events from
-              the current source.
-
-      :unsubscribe - the subscription will be unsubscribed
-                     automatically.
-
-  wait-for-source
-
-    The number of milliseconds to wait for a new source to join when
-    no sources were found or when all sources have left. A negative
-    value indicates that it will wait indefinitely. Default is -1.
-
-  channel
-
-    The channel to use for outputting the events."
-  [registry identifier & {:keys [on-source-join channel]
-                          :or {on-source-join :mix
-                               channel (a/chan)}
-                          :as options}]
-  (locking (.intern identifier)
-    (if (get @subscriptions identifier)
-      (throw (IllegalArgumentException. "cannot subscribe to an identifier twice"))
-      (let [sourcesc (p/watch-source registry identifier (if (= :mix on-source-join) :all :last))
-            commandc (a/chan)]
-        (subscribe* identifier channel sourcesc commandc
-                    (assoc options :on-source-join on-source-join))
-        (swap! subscriptions assoc identifier commandc)
-        channel))))
+  (unwatch-sources [this identifier chan]
+    "The given channel won't receive any updates on the directory
+     service anymore regarding the given topic. Returns the channel."))
 
 
-(defn unsubscribe
-  "Unsubscribes the given identifier and closes the event channel.
-  Returns a future, holding true whenver the unsubscription is
-  complete, or false whenever there was nothing to unsubscribe."
-  [identifier]
-  (if-let [commandc (get @subscriptions identifier)]
-    (do (println "Unsubscribing" identifier)
-        (a/put! commandc :unsubscribe)
-        (future (loop []
-                  (if (get @subscriptions identifier)
-                    (do (println "Still unsubscribing" identifier)
-                        (Thread/sleep 100)
-                        (recur))
-                    true))))
-    (future false)))
+(defprotocol Server
+  (publish [this identifier event]
+    "Publish an event on the given topic. The event source will be
+    registered automatically. I.e. the server implementation needs a
+    DirectoryWriter instance.")
 
-
-(def publish p/publish)
-(def done p/done)
+  (done [this identifier]
+    "Notify the server that the no more events for the given topic will
+    be published (for now). The event source will be unregistered from
+    the directory service."))

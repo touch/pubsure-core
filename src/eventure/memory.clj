@@ -1,5 +1,6 @@
 (ns eventure.memory
-  (:require [eventure.protocols :refer :all]
+  "A memory implementation of the core protocols."
+  (:require [eventure.core :refer :all]
             [clojure.core.async :as a])
   (:import [java.net URI]))
 
@@ -17,172 +18,155 @@
   (set (conj coll val)))
 
 
-;;; Registry implementation.
+;;; Directory service implementation in memory.
 
 (defn- signal
   "Sends an update to the source watches."
-  [event identifier ^URI uri watches]
-  (doseq [c (get @watches identifier)]
-    (debug "Signal" event "about" identifier "for" uri "to" c)
-    (when-not (a/put! c (->SourceUpdate identifier uri event))
-      (debug "Watch" c "on" identifier "closed, removing from registry.")
-      (swap! watches update-in [identifier] disj c))))
+  [event topic ^URI uri watches]
+  (doseq [c (get @watches topic)]
+    (debug "Signal" event "about" topic "for" uri "to" c)
+    (when-not (a/put! c (->SourceUpdate topic uri event))
+      (debug "Watch" c "on" topic "closed, removing from directory service.")
+      (swap! watches update-in [topic] disj c))))
 
 
-;; sources = {identifier (uri uri uri)} where first is latest join
-;; watches = {identifier #{chan chan chan}}
-(defrecord MemoryRegistry [sources watches]
-  Registry
-  (set-source [this identifier uri]
-    (let [updated (atom false)]
-      (dosync
-        (if (empty? (filter #(= % uri) (get @sources identifier)))
-          (do (alter sources update-in [identifier] conj uri)
-              (reset! updated true))
-          (reset! updated false)))
-      (when @updated
-        (debug "Set source" uri "for" identifier)
-        (signal :joined identifier uri watches))))
+;; sources = {topic (uri uri uri)} where first is latest join
+;; watches = {topic #{chan chan chan}}
+(defrecord MemoryDirectory [sources watches]
+  DirectoryWriter
+  (add-source [this topic uri]
+    (when (dosync
+            (when (empty? (filter #(= % uri) (get @sources topic)))
+              (alter sources update-in [topic] conj uri)))
+      (debug "Set source" uri "for" topic)
+      (signal :joined topic uri watches)))
 
-  (unset-source [this identifier uri]
-    (let [updated (atom false)]
-      (dosync
-        (let [current (get @sources identifier)
-              removed (remove #(= % uri) current)]
-          (if-not (= current removed)
-            (do (alter sources assoc identifier removed)
-                (reset! updated true))
-            (reset! updated false))))
-      (when @updated
-        (debug "Unset source" uri "for" identifier)
-        (signal :left identifier uri watches))))
+  (remove-source [this topic uri]
+    (when (dosync
+            (let [current (get @sources topic)
+                  removed (remove #(= % uri) current)]
+              (when-not (= current removed)
+                (alter sources assoc topic removed))))
+      (debug "Unset source" uri "for" topic)
+      (signal :left topic uri watches)))
 
-  (watch-source [this identifier init]
-    (watch-source this identifier init (a/chan)))
+  DirectoryReader
+  (sources [this topic]
+    (get @sources topic))
 
-  (watch-source [this identifier init chan]
-    (debug "Add watch" chan "on" identifier "using init" init)
-    (swap! watches update-in [identifier] conj-set chan)
-    (when-let [sources (seq (get @sources identifier))]
+  (watch-sources [this topic init]
+    (watch-sources this topic init (a/chan)))
+
+  (watch-sources [this topic init chan]
+    (debug "Add watch" chan "on" topic "using init" init)
+    (swap! watches update-in [topic] conj-set chan)
+    (when-let [sources (seq (get @sources topic))]
       (case init
-        :last (a/put! chan (->SourceUpdate identifier (first sources) :joined))
-        :all (doseq [source sources]
-               (a/put! chan (->SourceUpdate identifier source :joined)))))
+        :last (a/put! chan (->SourceUpdate topic (first sources) :joined))
+        :all (doseq [source sources] (a/put! chan (->SourceUpdate topic source :joined)))
+        :random (a/put! chan (->SourceUpdate topic (rand-nth sources) :joined))))
     chan)
 
-  (unwatch-source [this identifier chan]
-    (debug "Removing watch" chan "on" identifier)
-    (swap! watches update-in [identifier] disj chan)
+  (unwatch-sources [this topic chan]
+    (debug "Removing watch" chan "on" topic)
+    (swap! watches update-in [topic] disj chan)
     chan))
 
 
-(defn ->MemoryRegistry
+(defn mk-directory
   []
-  (MemoryRegistry. (ref {}) (atom {})))
+  (MemoryDirectory. (ref {}) (atom {})))
 
 
-;;; Client implementation.
+;;; Server implementation using core.async.
 
-(def ^:private streams (atom {})) ; {[uri identifier] mult}
+(def ^:private ca-servers (atom {})) ; uri -> CoreAsyncServer
+(def ^:private ca-mults (atom {})) ; [uri topic] -> mult
 
-;; subscriptions = {identifier chan}
-(defrecord MemoryClient [^URI uri subscriptions]
-  Client
-  (reusable? [this]
-    true)
-
-  (subscribe [this identifier]
-    (subscribe this identifier (a/chan)))
-
-  (subscribe [this identifier chan]
-    (debug "Client for" uri "subscribing" chan "to" identifier)
-    (assert (not (get @subscriptions identifier)))
-    (when-let [mult (get @streams [uri identifier])]
-      (a/tap mult chan)
-      (swap! subscriptions assoc identifier chan)
-      chan))
-
-  (unsubscribe [this identifier]
-    (when-let [chan (get @subscriptions identifier)]
-      (when-let [mult (get @streams [uri identifier])]
-        (debug "Client for" uri "unsubscribing" chan "from" identifier)
-        (a/untap mult chan)
-        (swap! subscriptions dissoc identifier))))
-
-  (disconnect [this]
-    (doseq [chan (vals @subscriptions)]
-      (a/close! chan))))
-
-
-(defmethod mk-client "memory"
-  [^URI uri]
-  (debug "Creating Memory Client for" uri)
-  (MemoryClient. uri (atom {})))
-
-
-;;; Server implementation.
-
-(def ^:private servers (atom #{}))
-
-(defn- channel-for-identifier
-  [registry channels uri identifier]
-  (debug "Server for" uri "requested channel for" identifier)
-  (if-let [channel (get @channels identifier)]
+(defn- channel-for-topic
+  [{:keys [uri directory channels] :as server} topic]
+  (debug "Server" uri "requested channel for topic" topic)
+  (if-let [channel (get @channels topic)]
     channel
     (let [channel (a/chan)]
-      (debug "Server for" uri "creating new channel for" identifier)
-      (swap! streams assoc [uri identifier] (a/mult channel))
-      (swap! channels assoc identifier channel)
-      (set-source registry identifier uri)
+      (debug "Creating and registering new channel for topic" topic "for server" uri)
+      (swap! ca-mults assoc [uri topic] (a/mult channel))
+      (swap! channels assoc topic channel)
+      (add-source directory topic uri)
       channel)))
 
-;; channels = {identifier chan}
-(defrecord MemoryServer [uri registry channels open send-last-event]
+;; channels = {topic chan}
+;; cache = ?
+(defrecord CoreAsyncServer [uri directory channels cache cache-size open]
   Server
-  (publish [this identifier event]
-    (debug "Publishing" event "for" identifier "through server for" uri)
+  (publish [this topic event]
+    (debug "Publishing" event "for" topic "through server for" uri)
     (assert @open)
-    (let [channel (channel-for-identifier registry channels uri identifier)]
-      ;; Need inverted pub-sub (consumer is server), so watching subscriptions won't miss messages
-      ;; while they are processing the :joined source event?
-      ;;
-      ;; topics/
-      ;;   test-topic/
-      ;;     pubs/
-      ;;       1: tcp://source-1
-      ;;       2: tcp://source-2
-      ;;     subs/
-      ;;       1: tcp://sub-1
-      ;;       2: tcp://sub-2
-      ;;       3: tcp://sub-3
-      (Thread/sleep 1000)
-      (a/put! channel event)))
+    (let [channel (channel-for-topic this topic)]
+      (a/put! channel event)
+      (swap! cache update-in [topic] (fn [c] (take cache-size (conj c event))))))
 
-  (done [this identifier]
-    (debug "Events for" identifier "through server for" uri "are done")
+  (done [this topic]
+    (debug "Events for" topic "through server for" uri "are done")
     (assert @open)
-    (when-let [channel (get @channels identifier)]
-      (swap! channels dissoc identifier)
-      (swap! streams dissoc [uri identifier])
+    (when-let [channel (get @channels topic)]
+      (swap! channels dissoc topic)
+      (swap! ca-mults dissoc [uri topic])
       (a/close! channel)
-      (unset-source registry identifier uri)))
-
-  (stop [this]
-    (when @open
-      (debug "Stopping server for" uri)
-      (reset! open false)
-      (doseq [[identifier channel] @channels]
-        (swap! channels dissoc identifier)
-        (swap! streams dissoc [uri identifier])
-        (a/close! channel)
-        (unset-source registry identifier uri))
-      (swap! servers disj uri))))
+      (remove-source directory topic uri))))
 
 
-(defn mk-memory-server
-  [host registry]
-  (debug "Creating Memory Server for" host)
-  (let [uri (URI. (str "memory://" host))]
-    (assert (not (get @servers uri)))
-    (swap! servers conj uri)
-    (MemoryServer. uri registry (atom {}) (atom true) false)))
+(defn mk-server
+  [name cache-size directory]
+  (debug "Creating core.async server named" name)
+  (let [uri (URI. (str "ca://" name))
+        server (CoreAsyncServer. uri directory (atom {}) (atom {}) cache-size (atom true))]
+    (assert (not (get @ca-servers uri)))
+    (swap! ca-servers assoc uri server)
+    server))
+
+
+(defn stop-server
+  [{:keys [uri open channels directory] :as server}]
+  (when @open
+    (debug "Stopping server for" uri)
+    (reset! open false)
+    (doseq [[topic channel] @channels]
+      (swap! ca-mults dissoc [name topic])
+      (a/close! channel)
+      (remove-source directory topic uri))
+    (swap! ca-servers dissoc uri)))
+
+
+;;; Client functions using core.async server.
+
+(defn subscribe
+  "Subscribes a, possibly default unbuffered, channel to the given
+  topic for the given server URI. The channel will close, whenever the
+  server does not publish on the specified topic or whenever it is
+  done sending messages on that topic. The `last` parameter is the
+  number of last messages one wants to receive first on the channel."
+  ([^URI uri topic last]
+     (subscribe uri topic last (a/chan)))
+  ([^URI uri topic last channel]
+     (debug "Subscribing to topic" topic "on server" uri "using channel" channel)
+     (if-let [{:keys [cache cache-size] :as server} (get @ca-servers uri)]
+       ;; Even when publisher is done, an open server may still send the last cached messages.
+       (let [cmessages (take last (reverse (get @cache topic)))]
+         (debug "Sending" (count cmessages) "cached messages for topic" topic "to" channel)
+         (doseq [event cmessages] (a/put! channel event))
+         (if-let [topicm (get @ca-mults [uri topic])]
+           (do (debug "Tapping" channel "to topic" topic)
+               (a/tap topicm channel))
+           (a/close! channel)))
+       (a/close! channel))
+     channel))
+
+
+(defn unsubscribe
+  "Unsubscribes the channel from the topic fro the given server uri.
+  Won't close the channel."
+  [^URI uri topic channel]
+  (when-let [topicm (get @ca-mults [uri topic])]
+    (debug "Unsubscribing channel" channel "from topic" topic "on server" uri)
+    (a/untap topicm channel)))
