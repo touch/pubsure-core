@@ -1,8 +1,8 @@
-(ns eventure.core-test
+(ns pubsure.core-test
   "Testing the model using the memory implementation."
   (:require [clojure.test :refer :all]
-            [eventure.core :refer :all]
-            [eventure.memory :as m]
+            [pubsure.core :refer :all]
+            [pubsure.memory :as m]
             [clojure.core.async :as a])
   (:import [java.net URI]))
 
@@ -41,16 +41,16 @@
 
 (deftest pub-sub
   (let [directory (m/mk-directory)
-        server (m/mk-server "source-1" 1 directory)
+        source (m/mk-source "source-1" 1 directory)
         sourcesc (watch-sources directory "test-topic" :last)]
-    (publish server "test-topic" "Hello World")
+    (publish source "test-topic" "Hello World")
     (Thread/sleep 100) ; Wait for the message to be put in the cache and dropped by the mult.
     (let [uri (:uri (first (a/alts!! [sourcesc (a/timeout 1000)])))
           subc (m/subscribe uri "test-topic" 1)]
       (is uri)
       (is (= (first (a/alts!! [subc (a/timeout 1000)])) "Hello World"))
-      (publish server "test-topic" "Hi again")
+      (publish source "test-topic" "Hi again")
       (is (= (first (a/alts!! [subc (a/timeout 1000)])) "Hi again"))
-      (done server "test-topic")
+      (done source "test-topic")
       (is (= (second (a/alts!! [subc (a/timeout 1000)])) subc)))
-    (m/stop-server server)))
+    (m/stop-source source)))

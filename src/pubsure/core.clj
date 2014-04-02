@@ -1,5 +1,5 @@
-(ns eventure.core
-  "The eventure API."
+(ns pubsure.core
+  "The pubsure API."
   (:import [java.net URI]))
 
 ;;; Protocol definitions.
@@ -43,13 +43,13 @@
      service anymore regarding the given topic. Returns the channel."))
 
 
-(defprotocol Server
-  (publish [this identifier event]
-    "Publish an event on the given topic. The event source will be
-    registered automatically. I.e. the server implementation needs a
-    DirectoryWriter instance.")
+(defprotocol Source
+  (publish [this topic message]
+    "Publish a message on the given topic. The Source will be
+    registered automatically in the directory service. I.e. the server
+    implementation needs a DirectoryWriter instance.")
 
-  (done [this identifier]
-    "Notify the server that the no more events for the given topic will
-    be published (for now). The event source will be unregistered from
-    the directory service."))
+  (done [this topic]
+    "Notify the Source that the no more messages for the given topic
+    will be published (for now). The Source will be unregistered
+    from the directory service, regarding the given topic."))
