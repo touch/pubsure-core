@@ -36,7 +36,9 @@
 
     :last - the last joined source is put on the channel.
 
-    :random - a randomly chosen source is put on the channel.")
+    :random - a randomly chosen source is put on the channel.
+
+    :none - no current source is put on the channel.")
 
   (unwatch-sources [this identifier chan]
     "The given channel won't receive any updates on the directory

@@ -53,7 +53,8 @@
       (case init
         :last (a/put! chan (->SourceUpdate topic (first sources) :joined))
         :all (doseq [source sources] (a/put! chan (->SourceUpdate topic source :joined)))
-        :random (a/put! chan (->SourceUpdate topic (rand-nth sources) :joined))))
+        :random (a/put! chan (->SourceUpdate topic (rand-nth sources) :joined))
+        :none 'noop))
     chan)
 
   (unwatch-sources [this topic chan]

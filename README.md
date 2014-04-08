@@ -6,7 +6,7 @@ Pubsure is a set of Clojure protocols that together form a publish-subscribe fra
 
 * A central directory service is used for registering to publisher sources for a specific topic. Potential subscribers use this directory to find the publishers.
 
-* The protocols do not deal with semantics like: 
+* The protocols do not deal with semantics like:
   * whether all subscribed clients receive all messages, or some load-balancing or work distribution takes place;
   * Starting, stopping and communication between the components;
   * How to deal with issues like the _slow joiner_ problem;
@@ -35,7 +35,9 @@ This protocol is for retrieving a one-time batch of current topic sources, or fo
 
   * `:last` - the last joined source is put on the channel.
 
-  * `:random` - a randomly chosen source is put on the channel.")
+  * `:random` - a randomly chosen source is put on the channel.
+
+  * `:none` - no current source is put on the channel.
 
 * `unwatch-sources [this identifier chan]` - The given channel won't receive any updates on the directory
      service anymore regarding the given topic. Returns the channel.
@@ -56,7 +58,7 @@ The [pubsure-zk](#) project holds a `DirectoryWriter` and `DirectoryReader` impl
 
 ### Websockets
 
-The [pubsure-ws](#) project holds a `Source` implementation, using Websockets publishing messages to its subscribers.
+The [pubsure-ws](#) project holds a `Source` implementation, using Websockets publishing messages to its subscribers. It also contains a Websocket server exposing a `DirectoryReader` implementation. Both use the WAMP specification for communication over the Websockets.
 
 ### Memory
 
