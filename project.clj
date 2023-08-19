@@ -1,12 +1,12 @@
-(defproject pubsure/pubsure-core "0.1.0-SNAPSHOT"
+(defproject pubsure/pubsure-core "0.2.0-SNAPSHOT"
   :description "FIXME: write description"
   :url "http://example.com/FIXME"
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
-  :dependencies [[org.clojure/clojure "1.5.1"]
-                 [org.clojure/core.async "0.1.278.0-76b25b-alpha"]
-                 [com.taoensso/timbre "3.1.6"]]
-  :pom-plugins [[com.theoryinpractise/clojure-maven-plugin "1.3.15"
+  :dependencies [[org.clojure/clojure "1.9.0"]
+                 [org.clojure/core.async "1.5.640"]
+                 [com.taoensso/timbre "6.2.2"]]
+  :pom-plugins [[com.theoryinpractise/clojure-maven-plugin "1.7.1"
                  {:extensions "true"
                   :executions ([:execution
                                 [:id "clojure-compile"]
